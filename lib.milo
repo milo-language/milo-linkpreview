@@ -1245,6 +1245,7 @@ fn fetchVetted(start: &string, accept: &string, opts: &PreviewOptions, deadline:
             method: "GET",
             headers: $"User-Agent: {opts.userAgent}\r\nAccept: {accept}\r\nAccept-Language: en",
             body: "",
+            keepAlive: true,
         }
         let limits = FetchTimeouts { connectMs: opts.connectMs, totalMs: left }
         // headroom for the status line and headers, which count against fetchAt's cap

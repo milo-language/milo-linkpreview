@@ -1,0 +1,21 @@
+// Fetch a URL and print its preview as JSON: milo run examples/preview.milo <url>
+from "../lib" import { fetchPreview, PreviewOptions }
+from "std/args" import { args }
+
+fn main(): i32 {
+    let argv = args()
+    if argv.len < 2 {
+        print("usage: preview <url>")
+        return 2
+    }
+    var opts = PreviewOptions.defaults()
+    opts.fetchOembed = true
+    match fetchPreview(argv[1], opts) {
+        Ok(p) => print(p.toJson())
+        Err(e) => {
+            print(e.message())
+            return 1
+        }
+    }
+    return 0
+}

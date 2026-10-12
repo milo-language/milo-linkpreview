@@ -1,0 +1,15 @@
+// Print the preview of a saved HTML file: milo run examples/dump.milo <base-url> <file>
+from "../lib" import { parseHtml }
+from "std/args" import { args }
+from "std/fs" import { readFile }
+
+fn main(): i32 {
+    let argv = args()
+    if argv.len < 3 {
+        print("usage: dump <base-url> <file.html>")
+        return 2
+    }
+    let html = readFile(argv[2])!
+    print(parseHtml(argv[1], html).toJson())
+    return 0
+}

@@ -1,0 +1,10 @@
+{
+  "name": "linkpreview",
+  "version": "0.1.0",
+  "description": "Link previews from Open Graph, Twitter cards, oEmbed and JSON-LD, with an SSRF-safe fetcher",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-linkpreview",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux"],
+  "exclude": ["tests/**", "examples/**", "scripts/**"]
+}

@@ -1,0 +1,1336 @@
+// linkpreview: Open Graph / Twitter card / oEmbed / JSON-LD link previews, with a
+// fetcher that refuses private and internal addresses on every hop.
+
+from "std/fetch" import { fetchAt, FetchOptions, FetchTimeouts, FetchResponse, urlEncode }
+from "std/html" import { Html }
+from "std/inflate" import { Inflate }
+from "std/json" import { Json }
+from "std/net" import { resolve, ip6, NetError }
+from "std/string" import { strIndexOfFromIgnoreCase }
+from "std/time" import { epochMillis }
+from "std/unicode" import { decodeCodepoint, encodeCodepoint }
+from "std/url" import { resolveUrl }
+
+// ── Public types ──
+
+// What a page says about itself. Every field but `url` is absent when the page did
+// not say; URLs are absolute http(s), text is decoded, whitespace-collapsed UTF-8.
+@derive(Json)
+pub struct Preview {
+    url: string,
+    canonicalUrl: string?,
+    title: string?,
+    description: string?,
+    siteName: string?,
+    image: string?,
+    imageWidth: i64?,
+    imageHeight: i64?,
+    imageAlt: string?,
+    // article, video, music, book, profile, website, repo, paper, image
+    kind: string?,
+    favicon: string?,
+    // the oEmbed endpoint the page advertised (or a known provider's), for a caller
+    // that wants to fetch it itself; fetchPreview fetches it when fetchOembed is on
+    oembedUrl: string?,
+    // the provider's embed markup, as sent: untrusted HTML, never insert it unsanitized
+    oembedHtml: string?,
+}
+
+// Limits and policy for fetchPreview. Build with PreviewOptions.defaults() and
+// change what you need.
+pub struct PreviewOptions {
+    userAgent: string,
+    // bytes of body read at most; parsing sees only these
+    maxBytes: i64,
+    connectMs: i64,
+    // the whole call: every redirect hop and the oEmbed request together
+    totalMs: i64,
+    maxRedirects: i64,
+    // also GET the page's oEmbed endpoint (one more request, same checks)
+    fetchOembed: bool,
+    // ports other than 80 for http and 443 for https
+    allowAnyPort: bool,
+    // 127.0.0.0/8 for tests and local development; never in a server that fetches
+    // URLs users chose, where it opens the host's own services to them
+    allowLoopback: bool,
+}
+
+impl PreviewOptions {
+    fn defaults(): PreviewOptions {
+        return PreviewOptions {
+            userAgent: "milo-linkpreview/0.1",
+            maxBytes: 262144,
+            connectMs: 5000,
+            totalMs: 10000,
+            maxRedirects: 5,
+            fetchOembed: false,
+            allowAnyPort: false,
+            allowLoopback: false,
+        }
+    }
+}
+
+pub enum PreviewError {
+    // not an http(s) URL, or one with credentials or an unparseable host
+    BadUrl(string),
+    // the URL or a redirect resolves to an address or port this fetcher refuses
+    Blocked(string),
+    Network(string),
+    Timeout(string),
+    HttpStatus(i32),
+    // the response is not HTML (its content type)
+    NotHtml(string),
+    TooManyRedirects,
+}
+
+impl PreviewError {
+    fn message(self: &Self): string {
+        return match self {
+            PreviewError.BadUrl(m) => $"bad url: {m}"
+            PreviewError.Blocked(m) => $"blocked: {m}"
+            PreviewError.Network(m) => $"network: {m}"
+            PreviewError.Timeout(m) => $"timeout: {m}"
+            PreviewError.HttpStatus(code) => $"http status {code}"
+            PreviewError.NotHtml(ct) => $"not html: {ct}"
+            PreviewError.TooManyRedirects => "too many redirects"
+        }
+    }
+}
+
+// ── Address policy ──
+
+// Whether an IPv4 address (std/net byte order: ip4(a, b, c, d)) is a public unicast
+// address. False for this-network 0/8, private 10/8, 172.16/12 and 192.168/16, CGNAT
+// 100.64/10, loopback 127/8, link-local 169.254/16 (cloud metadata lives there),
+// IETF 192.0.0/24, the documentation and benchmark ranges, multicast 224/4 and
+// reserved 240/4 including broadcast.
+pub fn isPublicIp4(ip: u32): bool {
+    let a = ip & 255
+    let b = (ip >> 8) & 255
+    let c = (ip >> 16) & 255
+    if a == 0 || a == 10 || a == 127 || a >= 224 {
+        return false
+    }
+    if a == 100 && b >= 64 && b < 128 {
+        return false
+    }
+    if a == 169 && b == 254 {
+        return false
+    }
+    if a == 172 && b >= 16 && b < 32 {
+        return false
+    }
+    if a == 192 && b == 168 {
+        return false
+    }
+    if a == 192 && b == 0 && (c == 0 || c == 2) {
+        return false
+    }
+    if a == 198 && (b == 18 || b == 19) {
+        return false
+    }
+    if (a == 198 && b == 51 && c == 100) || (a == 203 && b == 0 && c == 113) {
+        return false
+    }
+    return true
+}
+
+fn isLoopback4(ip: u32): bool {
+    return (ip & 255) == 127
+}
+
+fn embeddedIp4(addr: &[u8; 16], at: i64): u32 {
+    return (addr[at] as u32) | ((addr[at + 1] as u32) << 8) | ((addr[at + 2] as u32) << 16) | ((addr[at + 3] as u32) << 24)
+}
+
+// Whether an IPv6 address is public unicast. False for ::, ::1, unique-local fc00::/7,
+// link-local fe80::/10, site-local fec0::/10, multicast ff00::/8, documentation
+// 2001:db8::/32, and for the forms that carry an IPv4 address (IPv4-mapped
+// ::ffff:a.b.c.d, IPv4-compatible ::a.b.c.d, NAT64 64:ff9b::/96) whenever that
+// IPv4 address is not public itself.
+pub fn isPublicIp6(addr: &[u8; 16]): bool {
+    var zeros10 = true
+    for i in 0..10 {
+        if addr[i] != 0 {
+            zeros10 = false
+        }
+    }
+    if zeros10 && addr[10] == 0xff && addr[11] == 0xff {
+        return isPublicIp4(embeddedIp4(addr, 12))
+    }
+    if zeros10 && addr[10] == 0 && addr[11] == 0 {
+        // ::, ::1 and the deprecated IPv4-compatible block all land here
+        return isPublicIp4(embeddedIp4(addr, 12))
+    }
+    if addr[0] == 0 && addr[1] == 0x64 && addr[2] == 0xff && addr[3] == 0x9b {
+        return isPublicIp4(embeddedIp4(addr, 12))
+    }
+    if (addr[0] & 0xfe) == 0xfc || addr[0] == 0xff {
+        return false
+    }
+    if addr[0] == 0xfe && (addr[1] & 0xc0) >= 0x80 {
+        return false
+    }
+    if addr[0] == 0x20 && addr[1] == 0x01 && addr[2] == 0x0d && addr[3] == 0xb8 {
+        return false
+    }
+    return true
+}
+
+// Parse a dotted-quad literal strictly (four decimal octets, nothing else).
+fn parseIp4Literal(s: &string): u32? {
+    let parts = s.split(".")
+    if parts.len != 4 {
+        return None
+    }
+    var ip: u32 = 0
+    for k, p in parts {
+        if p.len == 0 || p.len > 3 {
+            return None
+        }
+        var v: u32 = 0
+        for b in p {
+            if b < '0' || b > '9' {
+                return None
+            }
+            v = v * 10 + (b - '0') as u32
+        }
+        if v > 255 {
+            return None
+        }
+        ip = ip | (v << ((k as u32) * 8))
+    }
+    return Some(ip)
+}
+
+// Whether an address literal ("8.8.8.8", "::1", "[fe80::1]") is public. A string
+// that is not an address literal is false.
+pub fn isPublicAddress(text: &string): bool {
+    var t = text.clone()
+    if t.startsWith("[") && t.endsWith("]") {
+        t = t.substr(1, t.len - 1)
+    }
+    if let Some(ip) = parseIp4Literal(t) {
+        return isPublicIp4(ip)
+    }
+    let Some(a6) = ip6(t) else { return false }
+    return isPublicIp6(a6)
+}
+
+// ── URL policy ──
+
+// An http(s) URL taken apart strictly and put back together, so the string handed
+// to the network layer has exactly the host and port that were checked.
+struct Target {
+    https: bool,
+    host: string,
+    port: i64,
+    explicitPort: bool,
+    // "/path?query", never empty, fragment dropped, control/space/non-ASCII bytes
+    // percent-encoded so nothing can end the request line early
+    pathQuery: string,
+}
+
+impl Target {
+    fn text(self: &Self): string {
+        var out = if self.https { "https://" } else { "http://" }
+        out.pushStr(self.host)
+        if self.explicitPort {
+            out.pushStr($":{self.port}")
+        }
+        out.pushStr(self.pathQuery)
+        return out
+    }
+}
+
+fn hexUpper(n: u8): u8 {
+    return if n < 10 { '0' + n } else { 'A' + n - 10 }
+}
+
+fn parseTarget(raw: &string): Result<Target, PreviewError> {
+    let s = raw.trim()
+    let lower = s.toLower()
+    var https = false
+    var i: i64 = 0
+    if lower.startsWith("https://") {
+        https = true
+        i = 8
+    } else if lower.startsWith("http://") {
+        i = 7
+    } else {
+        return Err(PreviewError.BadUrl("only http and https URLs are fetched"))
+    }
+    let authStart = i
+    while i < s.len && s[i] != '/' && s[i] != '?' && s[i] != '#' {
+        if s[i] == '@' || s[i] == '\\' {
+            // userinfo is how "http://trusted.example@10.0.0.1/" smuggles a host past
+            // a reader; nothing needs credentials in a preview fetch
+            return Err(PreviewError.BadUrl("credentials or backslash in URL authority"))
+        }
+        i += 1
+    }
+    let auth = s.substr(authStart, i).toLower()
+    var host = ""
+    var portText = ""
+    if auth.startsWith("[") {
+        let Some(close) = auth.indexOf("]") else { return Err(PreviewError.BadUrl("unclosed IPv6 literal")) }
+        host = auth.substr(0, close + 1)
+        let rest = auth.substr(close + 1, auth.len)
+        if rest.len > 0 {
+            if !rest.startsWith(":") {
+                return Err(PreviewError.BadUrl("junk after IPv6 literal"))
+            }
+            portText = rest.substr(1, rest.len)
+        }
+    } else {
+        let colon = auth.indexOf(":") ?? auth.len
+        host = auth.substr(0, colon)
+        if colon < auth.len {
+            portText = auth.substr(colon + 1, auth.len)
+        }
+        for b in host {
+            let ok = (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '.' || b == '-' || b == '_'
+            if !ok {
+                return Err(PreviewError.BadUrl("host must be ASCII (punycode for IDN)"))
+            }
+        }
+    }
+    if host.len == 0 || host.len > 253 {
+        return Err(PreviewError.BadUrl("missing or overlong host"))
+    }
+    var port: i64 = if https { 443 } else { 80 }
+    let explicitPort = portText.len > 0
+    if explicitPort {
+        if portText.len > 5 {
+            return Err(PreviewError.BadUrl("bad port"))
+        }
+        port = 0
+        for b in portText {
+            if b < '0' || b > '9' {
+                return Err(PreviewError.BadUrl("bad port"))
+            }
+            port = port * 10 + (b - '0') as i64
+        }
+        if port == 0 || port > 65535 {
+            return Err(PreviewError.BadUrl("bad port"))
+        }
+    }
+    var pq = ""
+    if i >= s.len || s[i] != '/' {
+        pq.push('/')
+    }
+    while i < s.len && s[i] != '#' {
+        let b = s[i]
+        if b <= 0x20 || b >= 0x7f {
+            pq.push('%')
+            pq.push(hexUpper(b >> 4))
+            pq.push(hexUpper(b & 15))
+        } else {
+            pq.push(b)
+        }
+        i += 1
+    }
+    return Ok(Target { https: https, host: host, port: port, explicitPort: explicitPort, pathQuery: pq })
+}
+
+// Vet `t` and return the one IPv4 address to connect to. The name is resolved once
+// here and the request goes to exactly this address (std/fetch fetchAt), so a DNS
+// answer that changes between the check and the connect cannot redirect it.
+fn vetTarget(t: &Target, opts: &PreviewOptions): Result<u32, PreviewError> {
+    let defaultPort: i64 = if t.https { 443 } else { 80 }
+    if t.port != defaultPort && !opts.allowAnyPort {
+        return Err(PreviewError.Blocked($"port {t.port} on {t.host}"))
+    }
+    if t.host.startsWith("[") {
+        if !isPublicAddress(t.host) {
+            return Err(PreviewError.Blocked($"address {t.host}"))
+        }
+        return Err(PreviewError.Network("IPv6 literal hosts are not supported"))
+    }
+    let Ok(ip) = resolve(t.host) else { return Err(PreviewError.Network($"cannot resolve {t.host}")) }
+    if isPublicIp4(ip) || (opts.allowLoopback && isLoopback4(ip)) {
+        return Ok(ip)
+    }
+    let a = ip & 255
+    let b = (ip >> 8) & 255
+    let c = (ip >> 16) & 255
+    let d = (ip >> 24) & 255
+    return Err(PreviewError.Blocked($"{t.host} resolves to {a}.{b}.{c}.{d}"))
+}
+
+// ── Text ──
+
+// The named references pages actually use in titles and descriptions. std/html's
+// unescape covers the five XML ones and numeric references; the full HTML5 table
+// has 2231 names and nearly all of them never appear in a <meta> tag.
+fn namedEntity(name: &string): i32 {
+    return match name {
+        "amp" => 38
+        "lt" => 60
+        "gt" => 62
+        "quot" => 34
+        "apos" => 39
+        "nbsp" => 160
+        "ndash" => 8211
+        "mdash" => 8212
+        "lsquo" => 8216
+        "rsquo" => 8217
+        "sbquo" => 8218
+        "ldquo" => 8220
+        "rdquo" => 8221
+        "bdquo" => 8222
+        "hellip" => 8230
+        "bull" => 8226
+        "middot" => 183
+        "laquo" => 171
+        "raquo" => 187
+        "lsaquo" => 8249
+        "rsaquo" => 8250
+        "copy" => 169
+        "reg" => 174
+        "trade" => 8482
+        "deg" => 176
+        "plusmn" => 177
+        "times" => 215
+        "divide" => 247
+        "euro" => 8364
+        "pound" => 163
+        "yen" => 165
+        "cent" => 162
+        "sect" => 167
+        "para" => 182
+        "dagger" => 8224
+        "prime" => 8242
+        "larr" => 8592
+        "rarr" => 8594
+        "uarr" => 8593
+        "darr" => 8595
+        "harr" => 8596
+        "rArr" => 8658
+        "le" => 8804
+        "ge" => 8805
+        "ne" => 8800
+        "asymp" => 8776
+        "infin" => 8734
+        "minus" => 8722
+        "frac12" => 189
+        "frac14" => 188
+        "frac34" => 190
+        "iexcl" => 161
+        "iquest" => 191
+        "shy" => 173
+        "zwj" => 8205
+        "zwnj" => 8204
+        "thinsp" => 8201
+        "ensp" => 8194
+        "emsp" => 8195
+        "aacute" => 225
+        "eacute" => 233
+        "iacute" => 237
+        "oacute" => 243
+        "uacute" => 250
+        "Aacute" => 193
+        "Eacute" => 201
+        "agrave" => 224
+        "egrave" => 232
+        "ecirc" => 234
+        "acirc" => 226
+        "ocirc" => 244
+        "auml" => 228
+        "euml" => 235
+        "iuml" => 239
+        "ouml" => 246
+        "uuml" => 252
+        "Auml" => 196
+        "Ouml" => 214
+        "Uuml" => 220
+        "szlig" => 223
+        "ccedil" => 231
+        "ntilde" => 241
+        "aring" => 229
+        "oslash" => 248
+        "aelig" => 230
+        _ => -1
+    }
+}
+
+fn isAlnum(b: u8): bool {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// Decode character references. A name without its ';' or one not in the table stays
+// literal, as "&image=" in a query string must.
+pub fn decodeEntities(s: &string): string {
+    if s.indexOf("&").isNone() {
+        return s.clone()
+    }
+    var out = ""
+    var i: i64 = 0
+    while i < s.len {
+        if s[i] != '&' {
+            out.push(s[i])
+            i += 1
+            continue
+        }
+        var j = i + 1
+        if j < s.len && s[j] == '#' {
+            j += 1
+            while j < s.len && j - i < 12 && isAlnum(s[j]) {
+                j += 1
+            }
+            if j < s.len && s[j] == ';' {
+                out.pushStr(Html.unescape(s.substr(i, j + 1)))
+                i = j + 1
+                continue
+            }
+        } else {
+            while j < s.len && j - i < 33 && isAlnum(s[j]) {
+                j += 1
+            }
+            if j < s.len && s[j] == ';' {
+                let cp = namedEntity(s.substr(i + 1, j))
+                if cp >= 0 {
+                    encodeCodepoint(&mut out, cp)
+                    i = j + 1
+                    continue
+                }
+            }
+        }
+        out.push('&')
+        i += 1
+    }
+    return out
+}
+
+// Decoded, whitespace-collapsed, valid UTF-8, at most `maxLen` bytes plus an
+// ellipsis when cut (on a word or character boundary). Invalid UTF-8 becomes U+FFFD so the result is always safe
+// to store as JSON text.
+fn cleanText(raw: &string, maxLen: i64): string {
+    let s = decodeEntities(raw)
+    var out = ""
+    var pendingSpace = false
+    var truncated = false
+    var i: i64 = 0
+    while i < s.len {
+        let cp = decodeCodepoint(s, i)
+        i += cp.size
+        let v = cp.value
+        // NBSP and the other Unicode spaces collapse like ASCII whitespace
+        let space = v == 32 || v == 9 || v == 10 || v == 13 || v == 12 || v == 160 || (v >= 8192 && v <= 8202) || v == 8239 || v == 12288
+        if space {
+            pendingSpace = out.len > 0
+            continue
+        }
+        if v < 32 || v == 127 || v == 173 || v == 8203 || v == 65279 {
+            continue
+        }
+        if pendingSpace {
+            if out.len + 1 > maxLen {
+                truncated = true
+                break
+            }
+            out.push(' ')
+            pendingSpace = false
+        }
+        var enc = ""
+        encodeCodepoint(&mut enc, v)
+        if out.len + enc.len > maxLen {
+            truncated = true
+            break
+        }
+        out.pushStr(enc)
+    }
+    if truncated {
+        // end on a word when one ends near the cut, and say the text goes on
+        var k = out.len - 1
+        while k > 0 && out.len - k < 40 && out[k] != ' ' {
+            k -= 1
+        }
+        if k > 0 && out[k] == ' ' {
+            out.truncate(k)
+        }
+        out.pushStr("…")
+    }
+    return out
+}
+
+fn textOpt(raw: &string, maxLen: i64): string? {
+    let t = cleanText(raw, maxLen)
+    if t.len == 0 {
+        return None
+    }
+    return Some(t)
+}
+
+fn parseDim(raw: &string): i64? {
+    let t = raw.trim()
+    var v: i64 = 0
+    var digits: i64 = 0
+    for b in t {
+        if b < '0' || b > '9' {
+            break
+        }
+        v = v * 10 + (b - '0') as i64
+        digits += 1
+        if digits > 6 {
+            return None
+        }
+    }
+    if digits == 0 || v == 0 {
+        return None
+    }
+    return Some(v)
+}
+
+// ── Tag scanning ──
+
+struct Attr {
+    name: string,
+    value: string,
+}
+
+struct Tag {
+    name: string,
+    closing: bool,
+    attrs: Vec<Attr>,
+    // byte offset just past the tag's '>'
+    end: i64,
+}
+
+impl Tag {
+    fn attr(self: &Self, name: &string): string? {
+        for a in self.attrs {
+            if a.name == name {
+                return Some(a.value.clone())
+            }
+        }
+        return None
+    }
+}
+
+fn isSpace(b: u8): bool {
+    return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == 12
+}
+
+fn isNameByte(b: u8): bool {
+    return isAlnum(b) || b == '-' || b == ':' || b == '_'
+}
+
+// The tag starting at the '<' at `at`, or None when that '<' does not open one
+// ("a < b" in text). Unterminated tags and attribute values run to the end of
+// input rather than failing: broken HTML still yields what it can.
+fn parseTag(h: &string, at: i64): Tag? {
+    var i = at + 1
+    var closing = false
+    if i < h.len && h[i] == '/' {
+        closing = true
+        i += 1
+    }
+    let nameStart = i
+    while i < h.len && isNameByte(h[i]) {
+        i += 1
+    }
+    if i == nameStart || !((h[nameStart] >= 'a' && h[nameStart] <= 'z') || (h[nameStart] >= 'A' && h[nameStart] <= 'Z')) {
+        return None
+    }
+    let name = h.substr(nameStart, i).toLower()
+    var attrs: Vec<Attr> = Vec.new()
+    while i < h.len {
+        while i < h.len && (isSpace(h[i]) || h[i] == '/') {
+            i += 1
+        }
+        if i >= h.len {
+            break
+        }
+        if h[i] == '>' {
+            i += 1
+            break
+        }
+        let an = i
+        while i < h.len && !isSpace(h[i]) && h[i] != '=' && h[i] != '>' && h[i] != '/' {
+            i += 1
+        }
+        if i == an {
+            // a lone '=' or similar junk: skip it so the scan always advances
+            i += 1
+            continue
+        }
+        let attrName = h.substr(an, i).toLower()
+        while i < h.len && isSpace(h[i]) {
+            i += 1
+        }
+        var value = ""
+        if i < h.len && h[i] == '=' {
+            i += 1
+            while i < h.len && isSpace(h[i]) {
+                i += 1
+            }
+            if i < h.len && (h[i] == '"' || h[i] == '\'') {
+                let q = h[i]
+                i += 1
+                let vs = i
+                while i < h.len && h[i] != q {
+                    i += 1
+                }
+                value = h.substr(vs, i)
+                if i < h.len {
+                    i += 1
+                }
+            } else {
+                let vs = i
+                while i < h.len && !isSpace(h[i]) && h[i] != '>' {
+                    i += 1
+                }
+                value = h.substr(vs, i)
+            }
+        }
+        if attrs.len < 64 {
+            attrs.push(Attr { name: attrName, value: decodeEntities(value) })
+        }
+    }
+    return Some(Tag { name: name, closing: closing, attrs: attrs, end: i })
+}
+
+// Offset of the `</name` that closes a raw-text element opened before `from`, or
+// the end of input.
+fn rawTextEnd(h: &string, from: i64, name: &string): i64 {
+    let at = strIndexOfFromIgnoreCase(h, $"</{name}", from)
+    return if at < 0 { h.len } else { at }
+}
+
+// ── Collected metadata ──
+
+// Everything the scan found, before priorities are applied. First value wins per
+// key, which keeps og:image:width paired with the first og:image.
+struct Found {
+    meta: HashMap<string, string>,
+    title: string?,
+    baseHref: string?,
+    canonical: string?,
+    oembed: string?,
+    imageSrc: string?,
+    icon: string?,
+    iconScore: i64,
+    img: string?,
+    imgAlt: string?,
+    imgWidth: i64?,
+    imgHeight: i64?,
+    ldTitle: string?,
+    ldDescription: string?,
+    ldImage: string?,
+    ldType: string?,
+    ldPublisher: string?,
+    ldSeen: i64,
+}
+
+fn metaGet(f: &Found, key: &string): string? {
+    let Some(v) = f.meta.get(key) else { return None }
+    return Some(v.clone())
+}
+
+fn relHas(rel: &string, token: &string): bool {
+    for t in rel.toLower().split(" ") {
+        if t == token {
+            return true
+        }
+    }
+    return false
+}
+
+fn onMeta(f: &mut Found, tag: &Tag) {
+    let content = tag.attr("content") ?? ""
+    let key = (firstOf(tag.attr("property"), firstOf(tag.attr("name"), tag.attr("itemprop"))) ?? "").toLower().trim()
+    if key.len == 0 || content.len == 0 || key.len > 64 {
+        return
+    }
+    if f.meta.get(key).isNone() && f.meta.len < 256 {
+        f.meta.insert(key, content)
+    }
+}
+
+fn onLink(f: &mut Found, tag: &Tag) {
+    let rel = tag.attr("rel") ?? ""
+    let Some(href) = tag.attr("href") else { return }
+    if href.trim().len == 0 {
+        return
+    }
+    if relHas(rel, "canonical") && f.canonical.isNone() {
+        f.canonical = Some(href.clone())
+    }
+    if relHas(rel, "image_src") && f.imageSrc.isNone() {
+        f.imageSrc = Some(href.clone())
+    }
+    let ty = (tag.attr("type") ?? "").toLower()
+    if relHas(rel, "alternate") && ty == "application/json+oembed" && f.oembed.isNone() {
+        f.oembed = Some(href.clone())
+    }
+    // icon > apple-touch-icon; among icons, one sized 32px or more wins
+    var score: i64 = 0
+    if relHas(rel, "icon") {
+        score = 2
+        let sizes = tag.attr("sizes") ?? ""
+        let px = parseDim(sizes) ?? 0
+        if px >= 32 && px <= 256 {
+            score = 3
+        }
+    } else if relHas(rel, "apple-touch-icon") || relHas(rel, "apple-touch-icon-precomposed") {
+        score = 1
+    }
+    if score > f.iconScore {
+        f.iconScore = score
+        f.icon = Some(href)
+    }
+}
+
+fn containsAny(s: &string, words: &[string]): bool {
+    for w in words {
+        if s.contains(w) {
+            return true
+        }
+    }
+    return false
+}
+
+// The first <img> that plausibly is content: not inline data, not a logo, icon,
+// avatar or tracking pixel by name, and not declared smaller than 120px.
+fn onImg(f: &mut Found, tag: &Tag) {
+    if f.img.isSome() {
+        return
+    }
+    let src = (tag.attr("src") ?? "").trim()
+    if src.len == 0 || src.toLower().startsWith("data:") {
+        return
+    }
+    let names = (src + " " + (tag.attr("class") ?? "") + " " + (tag.attr("id") ?? "")).toLower()
+    if containsAny(names, ["logo", "icon", "avatar", "sprite", "pixel", "spacer", "badge", "emoji", ".svg", ".gif"]) {
+        return
+    }
+    let w = parseDim(tag.attr("width") ?? "")
+    let h = parseDim(tag.attr("height") ?? "")
+    if (w ?? 1000) < 120 || (h ?? 1000) < 120 {
+        return
+    }
+    f.img = Some(src)
+    f.imgAlt = tag.attr("alt")
+    f.imgWidth = w
+    f.imgHeight = h
+}
+
+fn ldImageOf(j: &Json): string? {
+    if let Some(s) = j.asStr() {
+        return Some(s)
+    }
+    if let Some(u) = j.str("url") {
+        return Some(u)
+    }
+    if let Some(u) = j.str("contentUrl") {
+        return Some(u)
+    }
+    let Some(first) = j.at(0) else { return None }
+    return ldImageOf(first)
+}
+
+fn ldTypeOf(j: &Json): string? {
+    if let Some(t) = j.str("@type") {
+        return Some(t)
+    }
+    let Some(arr) = j.get("@type") else { return None }
+    let Some(first) = arr.at(0) else { return None }
+    return first.asStr()
+}
+
+// The first JSON-LD node with a headline or name supplies title, description,
+// image, type and publisher. Top-level arrays and @graph are searched one level.
+fn onLdNode(f: &mut Found, j: &Json) {
+    if f.ldTitle.isSome() || !j.isObject() {
+        return
+    }
+    let Some(title) = firstOf(j.str("headline"), j.str("name")) else { return }
+    f.ldTitle = Some(title)
+    f.ldDescription = j.str("description")
+    if let Some(img) = j.get("image") {
+        f.ldImage = ldImageOf(img)
+    } else if let Some(img) = j.get("thumbnailUrl") {
+        f.ldImage = ldImageOf(img)
+    }
+    f.ldType = ldTypeOf(j)
+    if let Some(p) = j.get("publisher") {
+        f.ldPublisher = p.str("name")
+    }
+}
+
+fn onLdJson(f: &mut Found, text: &string) {
+    f.ldSeen += 1
+    if f.ldSeen > 4 || text.len > 131072 {
+        return
+    }
+    let Ok(doc) = Json.parse(text.trim()) else { return }
+    if doc.isArray() {
+        for k in 0..doc.len() {
+            if let Some(n) = doc.at(k) {
+                onLdNode(&mut f, n)
+            }
+        }
+        return
+    }
+    if let Some(graph) = doc.get("@graph") {
+        for k in 0..graph.len() {
+            if let Some(n) = graph.at(k) {
+                onLdNode(&mut f, n)
+            }
+        }
+    }
+    onLdNode(&mut f, doc)
+}
+
+fn scan(h: &string): Found {
+    var f = Found {
+        meta: HashMap.new(), title: None, baseHref: None, canonical: None, oembed: None,
+        imageSrc: None, icon: None, iconScore: 0, img: None, imgAlt: None, imgWidth: None,
+        imgHeight: None, ldTitle: None, ldDescription: None, ldImage: None, ldType: None,
+        ldPublisher: None, ldSeen: 0,
+    }
+    var i: i64 = 0
+    while i < h.len {
+        let Some(lt) = h.indexOfFrom("<", i) else { break }
+        if lt + 4 <= h.len && h.substr(lt, lt + 4) == "<!--" {
+            let close = h.indexOfFrom("-->", lt + 4) ?? h.len
+            i = close + 3
+            continue
+        }
+        if lt + 1 < h.len && (h[lt + 1] == '!' || h[lt + 1] == '?') {
+            i = (h.indexOfFrom(">", lt) ?? h.len) + 1
+            continue
+        }
+        let Some(tag) = parseTag(h, lt) else {
+            i = lt + 1
+            continue
+        }
+        i = tag.end
+        if tag.closing {
+            continue
+        }
+        if tag.name == "meta" {
+            onMeta(&mut f, tag)
+        } else if tag.name == "link" {
+            onLink(&mut f, tag)
+        } else if tag.name == "base" {
+            if f.baseHref.isNone() {
+                f.baseHref = tag.attr("href")
+            }
+        } else if tag.name == "img" {
+            onImg(&mut f, tag)
+        } else if tag.name == "title" {
+            let end = rawTextEnd(h, i, "title")
+            if f.title.isNone() {
+                f.title = Some(h.substr(i, end))
+            }
+            i = end
+        } else if tag.name == "script" {
+            let end = rawTextEnd(h, i, "script")
+            let ty = (tag.attr("type") ?? "").toLower()
+            if ty.trim() == "application/ld+json" {
+                onLdJson(&mut f, h.substr(i, end))
+            }
+            i = end
+        } else if tag.name == "style" || tag.name == "textarea" || tag.name == "template" || tag.name == "svg" || tag.name == "noscript" {
+            // raw text, or markup whose <title>/<img> are not the page's own
+            i = rawTextEnd(h, i, tag.name)
+        }
+    }
+    return f
+}
+
+// ── Assembly ──
+
+// `raw` resolved against `base`, kept only if the result is an http(s) URL of sane
+// length.
+fn absUrl(base: &string, raw: &string): string? {
+    let t = raw.trim()
+    if t.len == 0 {
+        return None
+    }
+    let abs = resolveUrl(base, t)
+    let lower = abs.toLower()
+    if !(lower.startsWith("https://") || lower.startsWith("http://")) || abs.len > 2048 {
+        return None
+    }
+    for b in abs {
+        if b < 0x20 || b == 0x7f {
+            return None
+        }
+    }
+    return Some(abs)
+}
+
+fn absOpt(base: &string, raw: string?): string? {
+    let Some(r) = raw else { return None }
+    return absUrl(base, r)
+}
+
+fn firstOf(a: string?, b: string?): string? {
+    if a.isSome() {
+        return a
+    }
+    return b
+}
+
+fn hostOf(url: &string): string {
+    let Ok(t) = parseTarget(url) else { return "" }
+    return t.host
+}
+
+fn pathOf(url: &string): string {
+    let Ok(t) = parseTarget(url) else { return "" }
+    return t.pathQuery
+}
+
+// og:type, JSON-LD @type and a few well-known hosts, folded to one short word.
+fn kindOf(f: &Found, url: &string): string? {
+    let host = hostOf(url)
+    let path = pathOf(url)
+    if metaGet(f, "citation_title").isSome() || metaGet(f, "citation_pdf_url").isSome() {
+        return Some("paper")
+    }
+    if (host == "arxiv.org" && path.startsWith("/abs/")) || (host == "huggingface.co" && path.startsWith("/papers/")) {
+        return Some("paper")
+    }
+    if host == "github.com" {
+        let segs = beforeQuery(path).split("/")
+        // "/owner/repo" splits as ["", owner, repo]
+        if segs.len == 3 && segs[1].len > 0 && segs[2].len > 0 {
+            return Some("repo")
+        }
+    }
+    let ld = (f.ldType.clone() ?? "").toLower()
+    if ld == "scholarlyarticle" {
+        return Some("paper")
+    }
+    let og = (metaGet(f, "og:type") ?? "").toLower().trim()
+    if og.startsWith("video") || ld == "videoobject" {
+        return Some("video")
+    }
+    if og.startsWith("music") {
+        return Some("music")
+    }
+    if og == "article" || ld.endsWith("article") || ld == "blogposting" {
+        return Some("article")
+    }
+    if og.len > 0 && og.len <= 32 {
+        return Some(og)
+    }
+    return None
+}
+
+fn beforeQuery(s: &string): string {
+    let q = s.indexOf("?") ?? s.len
+    return s.substr(0, q)
+}
+
+fn youtubeId(host: &string, path: &string): string? {
+    if host == "youtu.be" {
+        let id = beforeQuery(path.substr(1, path.len))
+        return if id.len > 0 { Some(id) } else { None }
+    }
+    if !(host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com") {
+        return None
+    }
+    if path.startsWith("/shorts/") {
+        return Some(beforeQuery(path.substr(8, path.len)))
+    }
+    let Some(q) = path.indexOf("v=") else { return None }
+    var id = ""
+    var k = q + 2
+    while k < path.len && path[k] != '&' {
+        id.push(path[k])
+        k += 1
+    }
+    return if id.len > 0 { Some(id) } else { None }
+}
+
+// oEmbed endpoints for providers whose pages are too large to find their own
+// discovery link in a bounded read (a YouTube watch page puts <head> past 700 KB).
+fn knownOembed(url: &string): string? {
+    let host = hostOf(url)
+    let path = pathOf(url)
+    if youtubeId(host, path).isSome() {
+        return Some("https://www.youtube.com/oembed?format=json&url=" + urlEncode(url))
+    }
+    if (host == "vimeo.com" || host == "www.vimeo.com") && path.len > 1 && path[1] >= '0' && path[1] <= '9' {
+        return Some("https://vimeo.com/api/oembed.json?url=" + urlEncode(url))
+    }
+    return None
+}
+
+fn assemble(pageUrl: &string, f: &Found): Preview {
+    var base = pageUrl.clone()
+    if let Some(bh) = f.baseHref {
+        if let Some(b) = absUrl(pageUrl, bh) {
+            base = b
+        }
+    }
+    let ogImage = firstOf(metaGet(f, "og:image"), firstOf(metaGet(f, "og:image:url"), metaGet(f, "og:image:secure_url")))
+    let twImage = firstOf(metaGet(f, "twitter:image"), metaGet(f, "twitter:image:src"))
+    var image: string? = None
+    var width: i64? = None
+    var height: i64? = None
+    var alt: string? = None
+    if let Some(u) = absOpt(base, ogImage) {
+        image = Some(u)
+        width = parseDim(metaGet(f, "og:image:width") ?? "")
+        height = parseDim(metaGet(f, "og:image:height") ?? "")
+        alt = firstOf(metaGet(f, "og:image:alt"), metaGet(f, "twitter:image:alt"))
+    } else if let Some(u) = absOpt(base, twImage) {
+        image = Some(u)
+        width = parseDim(metaGet(f, "twitter:image:width") ?? "")
+        height = parseDim(metaGet(f, "twitter:image:height") ?? "")
+        alt = metaGet(f, "twitter:image:alt")
+    } else if let Some(u) = absOpt(base, f.ldImage.clone()) {
+        image = Some(u)
+    } else if let Some(u) = absOpt(base, f.imageSrc.clone()) {
+        image = Some(u)
+    } else if let Some(u) = absOpt(base, f.img.clone()) {
+        image = Some(u)
+        width = f.imgWidth
+        height = f.imgHeight
+        alt = f.imgAlt.clone()
+    }
+    let title = firstOf(metaGet(f, "og:title"), firstOf(metaGet(f, "twitter:title"), firstOf(f.ldTitle.clone(), f.title.clone())))
+    let description = firstOf(metaGet(f, "og:description"), firstOf(metaGet(f, "twitter:description"), firstOf(f.ldDescription.clone(), metaGet(f, "description"))))
+    let site = firstOf(metaGet(f, "og:site_name"), firstOf(metaGet(f, "application-name"), f.ldPublisher.clone()))
+    var favicon = absOpt(base, f.icon.clone())
+    if favicon.isNone() {
+        // what browsers fall back to; a 404 here is the renderer's to hide
+        favicon = absUrl(pageUrl, "/favicon.ico")
+    }
+    let oembed = firstOf(absOpt(base, f.oembed.clone()), knownOembed(pageUrl))
+    return Preview {
+        url: pageUrl.clone(),
+        canonicalUrl: firstOf(absOpt(base, f.canonical.clone()), absOpt(base, metaGet(f, "og:url"))),
+        title: textOpt(title ?? "", 300),
+        description: textOpt(description ?? "", 600),
+        siteName: textOpt(site ?? "", 100),
+        image: image,
+        imageWidth: width,
+        imageHeight: height,
+        imageAlt: textOpt(alt ?? "", 300),
+        kind: kindOf(f, pageUrl),
+        favicon: favicon,
+        oembedUrl: oembed,
+        oembedHtml: None,
+    }
+}
+
+// Read a preview out of `html`, the page at `baseUrl` (its final URL, after
+// redirects: relative URLs resolve against it, or against the page's <base href>).
+// Pure: no network. Broken markup yields whatever could be read from it.
+pub fn parseHtml(baseUrl: &string, html: &string): Preview {
+    let f = scan(html)
+    return assemble(baseUrl, f)
+}
+
+// Fill what the page left empty from an oEmbed JSON response, and take its html.
+pub fn mergeOembed(p: &mut Preview, body: &string) {
+    let Ok(j) = Json.parse(body) else { return }
+    if p.title.isNone() {
+        p.title = textOpt(j.str("title") ?? "", 300)
+    }
+    if p.siteName.isNone() {
+        p.siteName = textOpt(j.str("provider_name") ?? "", 100)
+    }
+    if p.image.isNone() {
+        if let Some(thumb) = absOpt(p.url, j.str("thumbnail_url")) {
+            p.image = Some(thumb)
+            p.imageWidth = j.i64("thumbnail_width")
+            p.imageHeight = j.i64("thumbnail_height")
+        }
+    }
+    if p.kind.isNone() {
+        let t = j.str("type") ?? ""
+        if t == "video" || t == "photo" {
+            p.kind = Some(if t == "photo" { "image" } else { "video" })
+        }
+    }
+    if let Some(h) = j.str("html") {
+        if h.len <= 16384 {
+            p.oembedHtml = Some(h)
+        }
+    }
+}
+
+// ── Fetching ──
+
+fn charsetOf(contentType: &string): string {
+    let lower = contentType.toLower()
+    let Some(at) = lower.indexOf("charset=") else { return "" }
+    var cs = lower.substr(at + 8, lower.len)
+    if cs.startsWith("\"") || cs.startsWith("'") {
+        cs = cs.substr(1, cs.len)
+    }
+    var end: i64 = 0
+    while end < cs.len && (isAlnum(cs[end]) || cs[end] == '-' || cs[end] == '_') {
+        end += 1
+    }
+    return cs.substr(0, end)
+}
+
+// The charset a <meta> in the first 2 KB declares, as browsers prescan for it.
+fn metaCharset(h: &string): string {
+    let head = h.substr(0, if h.len < 2048 { h.len } else { 2048 }).toLower()
+    let Some(at) = head.indexOf("charset=") else { return "" }
+    var k = at + 8
+    while k < head.len && (head[k] == '"' || head[k] == '\'') {
+        k += 1
+    }
+    var end = k
+    while end < head.len && (isAlnum(head[end]) || head[end] == '-' || head[end] == '_') {
+        end += 1
+    }
+    return head.substr(k, end)
+}
+
+// windows-1252's 0x80-0x9F row; every other byte maps to the same code point.
+fn cp1252(b: u8): i32 {
+    let row: [i32; 32] = [8364, 129, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 352, 8249, 338, 141, 381, 143, 144, 8216, 8217, 8220, 8221, 8226, 8211, 8212, 732, 8482, 353, 8250, 339, 157, 382, 376]
+    if b >= 0x80 && b < 0xa0 {
+        return row[(b - 0x80) as i64]
+    }
+    return b as i32
+}
+
+// Latin-1 labels are decoded as windows-1252, as the WHATWG encoding spec does;
+// anything else is passed through as UTF-8 (cleanText replaces invalid bytes).
+fn toUtf8(body: string, charset: &string): string {
+    let latin = charset == "iso-8859-1" || charset == "latin1" || charset == "windows-1252" || charset == "cp1252" || charset == "us-ascii" || charset == "ascii" || charset == "iso8859-1"
+    if !latin {
+        return body
+    }
+    var out = ""
+    for b in body {
+        if b < 0x80 {
+            out.push(b)
+        } else {
+            encodeCodepoint(&mut out, cp1252(b))
+        }
+    }
+    return out
+}
+
+fn netErr(e: &NetError): PreviewError {
+    return match e {
+        NetError.Timeout(stage) => PreviewError.Timeout(stage.clone())
+        _ => PreviewError.Network(e.message())
+    }
+}
+
+// Deadline-bounded GET of one vetted URL, following up to opts.maxRedirects
+// redirects, each one parsed and vetted again before anything is sent to it.
+// Returns the final URL with the response.
+struct Fetched {
+    url: string,
+    resp: FetchResponse,
+}
+
+fn fetchVetted(start: &string, accept: &string, opts: &PreviewOptions, deadline: i64): Result<Fetched, PreviewError> {
+    var url = parseTarget(start)?.text()
+    var hops: i64 = 0
+    while true {
+        let t = parseTarget(url)?
+        let ip = vetTarget(t, opts)?
+        let left = deadline - epochMillis()
+        if left <= 0 {
+            return Err(PreviewError.Timeout("total"))
+        }
+        let req = FetchOptions {
+            method: "GET",
+            headers: $"User-Agent: {opts.userAgent}\r\nAccept: {accept}\r\nAccept-Language: en",
+            body: "",
+        }
+        let limits = FetchTimeouts { connectMs: opts.connectMs, totalMs: left }
+        // headroom for the status line and headers, which count against fetchAt's cap
+        let resp = fetchAt(ip, t.text(), req, limits, opts.maxBytes + 16384).mapErr(netErr)?
+        let s = resp.status
+        if s == 301 || s == 302 || s == 303 || s == 307 || s == 308 {
+            let Some(loc) = resp.header("Location") else { return Err(PreviewError.HttpStatus(s)) }
+            hops += 1
+            if hops > opts.maxRedirects {
+                return Err(PreviewError.TooManyRedirects)
+            }
+            url = parseTarget(resolveUrl(t.text(), loc.trim()))?.text()
+            continue
+        }
+        if s < 200 || s >= 300 {
+            return Err(PreviewError.HttpStatus(s))
+        }
+        return Ok(Fetched { url: t.text(), resp: resp })
+    }
+    return Err(PreviewError.TooManyRedirects)
+}
+
+fn bodyOf(resp: &FetchResponse, maxBytes: i64): Result<string, PreviewError> {
+    var body = resp.body.clone()
+    let enc = (resp.header("Content-Encoding") ?? "").toLower().trim()
+    if enc == "gzip" || enc == "x-gzip" {
+        // sent although never asked for; a body cut at the byte cap does not inflate
+        let Ok(plain) = Inflate.gzip(body) else { return Err(PreviewError.Network("undecodable gzip body")) }
+        body = plain
+    } else if enc.len > 0 && enc != "identity" {
+        return Err(PreviewError.Network($"unsupported content encoding {enc}"))
+    }
+    if body.len > maxBytes {
+        // substr, not truncate: the cut may fall inside a UTF-8 sequence, which
+        // truncate traps on and cleanText later turns into U+FFFD
+        body = body.substr(0, maxBytes)
+    }
+    return Ok(body)
+}
+
+fn isHtmlType(ct: &string, body: &string): bool {
+    let t = ct.toLower()
+    if t.startsWith("text/html") || t.startsWith("application/xhtml+xml") {
+        return true
+    }
+    if t.trim().len > 0 {
+        return false
+    }
+    // no Content-Type at all: sniff for markup
+    return body.trim().startsWith("<")
+}
+
+// Fetch `url` and read its preview. Only http(s) on the default ports; the host is
+// resolved once per hop and refused if any hop lands on a private, loopback,
+// link-local, CGNAT, multicast or reserved address (see README). Reads at most
+// opts.maxBytes of HTML. An image URL previews as itself.
+pub fn fetchPreview(url: &string, opts: &PreviewOptions): Result<Preview, PreviewError> {
+    let deadline = epochMillis() + opts.totalMs
+    let got = fetchVetted(url, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1", opts, deadline)?
+    let ct = got.resp.header("Content-Type") ?? ""
+    if ct.toLower().startsWith("image/") {
+        var p = parseHtml(got.url, "")
+        p.image = Some(got.url.clone())
+        p.kind = Some("image")
+        return Ok(p)
+    }
+    var body = bodyOf(got.resp, opts.maxBytes)?
+    if !isHtmlType(ct, body) {
+        return Err(PreviewError.NotHtml(ct))
+    }
+    var charset = charsetOf(ct)
+    if charset.len == 0 {
+        charset = metaCharset(body)
+    }
+    body = toUtf8(body, charset)
+    var p = parseHtml(got.url, body)
+    if opts.fetchOembed {
+        if let Some(endpoint) = p.oembedUrl.clone() {
+            // the endpoint came from the page, so it is as untrusted as the page's URL
+            // and goes through the same checks; failure leaves the HTML preview as is
+            if let Ok(o) = fetchVetted(endpoint, "application/json", opts, deadline) {
+                if let Ok(ob) = bodyOf(o.resp, 65536) {
+                    mergeOembed(&mut p, ob)
+                }
+            }
+        }
+    }
+    return Ok(p)
+}

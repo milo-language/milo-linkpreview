@@ -1,0 +1,69 @@
+// Mutation fuzzer for parseHtml: cuts, byte flips and spliced markup over the saved
+// pages. Any trap (out-of-range slice, failed unwrap) aborts the run with the seed.
+//   milo run --release scripts/fuzz.milo [iterations] [seed]
+from "../lib" import { parseHtml }
+from "std/args" import { args }
+from "std/fs" import { readFile }
+from "std/rng" import { Rng }
+from "std/strconv" import { parseInt }
+
+fn mutate(src: &string, rng: &mut Rng): string {
+    let tokens = ["<", ">", "\"", "'", "&", "&#", "&#x", ";", "<!--", "-->", "<meta property=og:image content=", "<title>", "</title>", "<script type=application/ld+json>{", "</script>", "<base href=", "=", " ", "\xff", "\xe2\x80", "<link rel=icon href=", "<img src=", "//", "../", "?", "#", "[::1]", "javascript:"]
+    var out = src.clone()
+    let edits = rng.range(1, 12)
+    for _e in 0..edits {
+        if out.len == 0 {
+            out.pushStr(tokens[rng.int(tokens.len)])
+            continue
+        }
+        let at = rng.int(out.len)
+        let op = rng.int(4)
+        if op == 0 {
+            out = out.substr(0, at)
+        } else if op == 1 {
+            var b = out.substr(0, at)
+            b.push(rng.int(256) as u8)
+            b.pushStr(out.substr(if at + 1 < out.len { at + 1 } else { out.len }, out.len))
+            out = b
+        } else if op == 2 {
+            var b = out.substr(0, at)
+            b.pushStr(tokens[rng.int(tokens.len)])
+            b.pushStr(out.substr(at, out.len))
+            out = b
+        } else {
+            let len = rng.range(1, 200)
+            let end = if at + len < out.len { at + len } else { out.len }
+            var b = out.substr(0, at)
+            b.pushStr(out.substr(end, out.len))
+            out = b
+        }
+    }
+    return out
+}
+
+fn main(): i32 {
+    let argv = args()
+    let iters = if argv.len > 1 { parseInt(argv[1]) ?? 2000 } else { 2000 }
+    let seed = if argv.len > 2 { parseInt(argv[2]) ?? 1 } else { 1 }
+    var pages: Vec<string> = Vec.new()
+    for name in ["phoronix.html", "github-repo.html", "youtube.html", "hf-paper.html", "arxiv-abs.html"] {
+        let full = readFile($"tests/pages/{name}")!
+        // a window around <head> keeps iterations fast while covering the tags that matter
+        pages.push(full.substr(0, if full.len < 40000 { full.len } else { 40000 }))
+    }
+    var rng = Rng.new(seed)
+    var titled: i64 = 0
+    for i in 0..iters {
+        let src = pages[rng.int(pages.len)]
+        let html = mutate(src, &mut rng)
+        let p = parseHtml("https://example.com/a/b?c", html)
+        if p.title.isSome() {
+            titled += 1
+        }
+        if i % 500 == 0 {
+            print($"{i} iterations, seed {seed}")
+        }
+    }
+    print($"done: {iters} iterations, {titled} with a title")
+    return 0
+}

@@ -1,0 +1,400 @@
+// Run from the repo root: milo test tests/linkpreview_test.milo
+// Pages under tests/pages are real captures (see tests/pages/README). Nothing here
+// touches the network: blocked fetches are refused before any connect, and the
+// fetch tests talk to listeners on 127.0.0.1.
+from "../lib" import { parseHtml, fetchPreview, Preview, PreviewOptions, PreviewError, isPublicIp4, isPublicIp6, isPublicAddress, decodeEntities, mergeOembed }
+from "std/fs" import { readFile }
+from "std/net" import { TcpListener, TcpStream, ip4, ip6 }
+from "std/runtime" import { Task }
+from "std/testing" import { assertStrEqual, assertMsg, assertEqual64, assertTrue, assertFalse, assertContains }
+from "std/time" import { epochMillis, sleepFor, Duration }
+
+fn page(name: &string): string {
+    return readFile($"tests/pages/{name}")!
+}
+
+fn s(o: &string?): string {
+    return o.clone() ?? "<none>"
+}
+
+fn n(o: &i64?): i64 {
+    return o.clone() ?? -1
+}
+
+// ── Real pages ──
+
+fn testPhoronixArticle() {
+    // og:* written as name= rather than property=, and an og:image whose query keeps
+    // a raw "&image=" that must not be read as an entity
+    let p = parseHtml("https://www.phoronix.com/news/Linux-6.17-Released", page("phoronix.html"))
+    assertStrEqual(s(p.title), "Linux 6.17 Released: Intel Panther Lake Xe3 Graphics Ready, New Optimizations")
+    assertStrEqual(s(p.image), "https://www.phoronix.net/image.php?id=2025&image=linux_617_released")
+    assertContains(s(p.description), "Linus Torvalds just released the Linux 6.17 kernel")
+    assertStrEqual(s(p.favicon), "https://www.phoronix.com/favicon-32x32.png")
+}
+
+fn testGithubRepo() {
+    let p = parseHtml("https://github.com/pypa/pipx", page("github-repo.html"))
+    assertStrEqual(s(p.kind), "repo")
+    assertStrEqual(s(p.siteName), "GitHub")
+    assertStrEqual(s(p.canonicalUrl), "https://github.com/pypa/pipx")
+    assertContains(s(p.image), "https://opengraph.githubassets.com/")
+    assertEqual64(n(p.imageWidth), 1200)
+    assertEqual64(n(p.imageHeight), 600)
+    assertStrEqual(s(p.title), "GitHub - pypa/pipx: Install and Run Python Applications in Isolated Environments")
+}
+
+fn testYoutube() {
+    let p = parseHtml("https://www.youtube.com/watch?v=dQw4w9WgXcQ", page("youtube.html"))
+    assertStrEqual(s(p.kind), "video")
+    assertStrEqual(s(p.siteName), "YouTube")
+    assertStrEqual(s(p.image), "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg")
+    assertEqual64(n(p.imageWidth), 1280)
+    // the discovery link's &amp; decodes to the endpoint's real query
+    assertStrEqual(s(p.oembedUrl), "https://www.youtube.com/oembed?format=json&url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ")
+    // curly quotes and an emoji come through as UTF-8
+    assertContains(s(p.description), "“Never Gonna Give You Up”")
+}
+
+fn testYoutubePastTheByteCap() {
+    // The live page puts <head> 770 KB in; a capped read sees none of it, so the
+    // provider's oEmbed endpoint is still known from the URL alone.
+    let p = parseHtml("https://youtu.be/dQw4w9WgXcQ", "<html><script>var big = 1</script>")
+    assertStrEqual(s(p.title), "<none>")
+    assertStrEqual(s(p.oembedUrl), "https://www.youtube.com/oembed?format=json&url=https%3A%2F%2Fyoutu.be%2FdQw4w9WgXcQ")
+}
+
+fn testHuggingFacePaper() {
+    let p = parseHtml("https://huggingface.co/papers/2409.12917", page("hf-paper.html"))
+    assertStrEqual(s(p.kind), "paper")
+    assertStrEqual(s(p.image), "https://cdn-thumbnails.huggingface.co/social-thumbnails/papers/2409.12917/gradient.png")
+    assertContains(s(p.title), "Training Language Models to Self-Correct via Reinforcement Learning")
+}
+
+fn testArxivAbs() {
+    let p = parseHtml("https://arxiv.org/abs/1706.03762", page("arxiv-abs.html"))
+    assertStrEqual(s(p.kind), "paper")
+    assertStrEqual(s(p.title), "Attention Is All You Need")
+    assertStrEqual(s(p.siteName), "arXiv.org")
+    // relative og:image resolved against the page
+    assertStrEqual(s(p.image), "https://arxiv.org/static/browse/0.3.4/images/arxiv-logo-fb.png")
+    // long abstract cut on a word with an ellipsis, well under the cap
+    let d = s(p.description)
+    assertTrue(d.endsWith("…"))
+    assertTrue(d.len <= 603)
+    assertFalse(d.endsWith(" …"))
+}
+
+// ── Synthetic pages ──
+
+fn testTitleOnly() {
+    let p = parseHtml("http://example.com/a/b", "<html><head><TITLE>\n  Just   a\ttitle \n</TITLE></head><body>hi</body></html>")
+    assertStrEqual(s(p.title), "Just a title")
+    assertStrEqual(s(p.description), "<none>")
+    assertStrEqual(s(p.image), "<none>")
+    assertStrEqual(s(p.favicon), "http://example.com/favicon.ico")
+    assertStrEqual(s(p.kind), "<none>")
+}
+
+fn testRelativeUrlsAndBase() {
+    let html = "<head><base href=\"https://cdn.example.net/assets/\"><meta property=\"og:image\" content=\"../img/card.png\"><link rel=icon href=fav.png><link rel=canonical href=\"/story\"></head>"
+    let p = parseHtml("https://www.example.com/news/2026/story.html", html)
+    assertStrEqual(s(p.image), "https://cdn.example.net/img/card.png")
+    assertStrEqual(s(p.favicon), "https://cdn.example.net/assets/fav.png")
+    assertStrEqual(s(p.canonicalUrl), "https://cdn.example.net/story")
+    let noBase = parseHtml("https://www.example.com/news/2026/story.html", "<meta property=og:image content=//img.example.org/x.jpg>")
+    assertStrEqual(s(noBase.image), "https://img.example.org/x.jpg")
+}
+
+fn testEntities() {
+    let html = "<meta property=\"og:title\" content=\"Tom &amp; Jerry&#39;s &ldquo;Caf&eacute;&rdquo; &mdash; &#x1F600; &nbsp;done&hellip;\"><meta name=description content=\"a &unknown; b &amp c\">"
+    let p = parseHtml("https://example.com/", html)
+    assertStrEqual(s(p.title), "Tom & Jerry's “Café” — 😀 done…")
+    assertStrEqual(s(p.description), "a &unknown; b &amp c")
+    assertStrEqual(decodeEntities("x&lt;y&gt;z"), "x<y>z")
+}
+
+fn testBrokenHtml() {
+    // unclosed attribute quote, stray '<', a comment hiding a tag, an unterminated
+    // <title>, and invalid UTF-8: nothing traps, and what is readable is read
+    let html = "<html><head a < b <!-- <meta property=og:title content=hidden> --><meta property=og:description content=\"fine\"><meta property=og:title content=\"unclosed><title>T\xff\xfeX"
+    let p = parseHtml("https://example.com/", html)
+    assertStrEqual(s(p.description), "fine")
+    assertMsg(s(p.title) != "hidden", "commented-out meta ignored")
+    let q = parseHtml("https://example.com/", "<title>A\xffB</title><meta property=\"og:image\" content=\"javascript:alert(1)\">")
+    assertStrEqual(s(q.title), "A\u{FFFD}B")
+    assertStrEqual(s(q.image), "<none>")
+    let empty = parseHtml("https://example.com/", "")
+    assertStrEqual(empty.url, "https://example.com/")
+    let lt = parseHtml("https://example.com/", "<<<<>")
+    assertStrEqual(s(lt.title), "<none>")
+}
+
+fn testPriorities() {
+    let html = "<title>plain</title><meta name=twitter:title content=tw><meta property=og:title content=og><script type=\"application/ld+json\">{\"@type\":\"NewsArticle\",\"headline\":\"ld\",\"image\":[{\"url\":\"/ld.jpg\"}],\"publisher\":{\"name\":\"Pub\"}}</script>"
+    let p = parseHtml("https://example.com/x", html)
+    assertStrEqual(s(p.title), "og")
+    assertStrEqual(s(p.image), "https://example.com/ld.jpg")
+    assertStrEqual(s(p.siteName), "Pub")
+    assertStrEqual(s(p.kind), "article")
+    let ldOnly = parseHtml("https://example.com/x", "<title>plain</title><script type=application/ld+json>[{\"@graph\":[]},{\"@type\":\"VideoObject\",\"name\":\"clip\",\"thumbnailUrl\":\"https://example.com/t.jpg\"}]</script>")
+    assertStrEqual(s(ldOnly.title), "clip")
+    assertStrEqual(s(ldOnly.kind), "video")
+    assertStrEqual(s(ldOnly.image), "https://example.com/t.jpg")
+}
+
+fn testFallbackImage() {
+    let html = "<body><img src=/logo.png width=400 height=100><img src=\"data:image/png;base64,xx\"><img src=/tiny.jpg width=1 height=1><img src=/hero.jpg width=800 height=450 alt=\"Hero shot\"></body>"
+    let p = parseHtml("https://example.com/post", html)
+    assertStrEqual(s(p.image), "https://example.com/hero.jpg")
+    assertEqual64(n(p.imageWidth), 800)
+    assertStrEqual(s(p.imageAlt), "Hero shot")
+}
+
+fn testScriptAndStyleAreNotMarkup() {
+    let html = "<script>var s = '<meta property=\"og:title\" content=\"from script\">'</script><style>a{}</style><svg><title>icon</title></svg><title>real</title>"
+    let p = parseHtml("https://example.com/", html)
+    assertStrEqual(s(p.title), "real")
+}
+
+fn testOembedMerge() {
+    var p = parseHtml("https://www.youtube.com/watch?v=abc", "")
+    mergeOembed(&mut p, "{\"title\":\"A video\",\"provider_name\":\"YouTube\",\"thumbnail_url\":\"https://i.ytimg.com/vi/abc/hqdefault.jpg\",\"thumbnail_width\":480,\"thumbnail_height\":360,\"type\":\"video\",\"html\":\"<iframe></iframe>\"}")
+    assertStrEqual(s(p.title), "A video")
+    assertStrEqual(s(p.image), "https://i.ytimg.com/vi/abc/hqdefault.jpg")
+    assertEqual64(n(p.imageHeight), 360)
+    assertStrEqual(s(p.kind), "video")
+    assertStrEqual(s(p.oembedHtml), "<iframe></iframe>")
+}
+
+fn testPreviewJson() {
+    let p = parseHtml("https://example.com/", "<title>t</title>")
+    let back = Preview.fromJson(p.toJson())!
+    assertStrEqual(s(back.title), "t")
+}
+
+// ── Address policy ──
+
+fn testBlockedIp4Ranges() {
+    let blocked = ["0.0.0.0", "0.1.2.3", "10.0.0.1", "10.255.255.255", "100.64.0.1", "100.127.255.254", "127.0.0.1", "127.8.8.8", "169.254.169.254", "169.254.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1", "192.0.0.8", "192.0.2.1", "198.18.0.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255"]
+    for a in blocked {
+        assertMsg(!isPublicAddress(a), $"{a} must be blocked")
+    }
+    let public = ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "172.15.255.255", "172.32.0.1", "192.169.0.1", "169.253.1.1", "11.0.0.1", "223.255.255.255"]
+    for a in public {
+        assertMsg(isPublicAddress(a), $"{a} must be allowed")
+    }
+    assertFalse(isPublicIp4(ip4(169, 254, 169, 254)))
+    assertTrue(isPublicIp4(ip4(140, 82, 112, 3)))
+}
+
+fn testBlockedIp6Ranges() {
+    let blocked = ["::", "::1", "[::1]", "fc00::1", "fd12:3456::1", "fe80::1", "febf::1", "fec0::1", "ff02::1", "2001:db8::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::ffff:7f00:1", "::127.0.0.1", "64:ff9b::a9fe:a9fe", "64:ff9b::192.168.0.1"]
+    for a in blocked {
+        assertMsg(!isPublicAddress(a), $"{a} must be blocked")
+    }
+    let public = ["2606:4700:4700::1111", "2a00:1450:4001:80b::200e", "::ffff:8.8.8.8", "64:ff9b::808:808"]
+    for a in public {
+        assertMsg(isPublicAddress(a), $"{a} must be allowed")
+    }
+    assertFalse(isPublicAddress("not-an-ip"))
+    assertFalse(isPublicIp6(ip6("fe80::1")!))
+}
+
+fn isBlocked(r: &Result<Preview, PreviewError>): bool {
+    return errText(r).startsWith("blocked:")
+}
+
+fn isBadUrl(r: &Result<Preview, PreviewError>): bool {
+    return errText(r).startsWith("bad url:")
+}
+
+fn errText(r: &Result<Preview, PreviewError>): string {
+    return match r {
+        Ok(_) => "ok"
+        Err(e) => e.message()
+    }
+}
+
+fn testFetchRefusesPrivateTargets() {
+    let opts = PreviewOptions.defaults()
+    // each of these is refused before a connection is attempted; "localhost" and
+    // the decimal and hex spellings go through the resolver, which answers locally
+    let urls = ["http://127.0.0.1/", "http://localhost/", "http://LOCALHOST./admin", "https://10.0.0.5/", "http://169.254.169.254/latest/meta-data/", "http://100.64.1.1/", "http://192.168.0.1/", "http://172.20.0.1/", "http://0.0.0.0/", "http://2130706433/", "http://0x7f000001/", "http://224.0.0.1/", "http://[::1]/", "http://[::ffff:127.0.0.1]/", "http://[fe80::1]/", "http://[fd00::1]/"]
+    for u in urls {
+        let r = fetchPreview(u, opts)
+        assertMsg(isBlocked(r), $"{u} -> {errText(r)}")
+    }
+}
+
+fn testFetchRefusesBadUrlsAndPorts() {
+    let opts = PreviewOptions.defaults()
+    let bad = ["file:///etc/passwd", "ftp://example.com/", "gopher://example.com/", "javascript:alert(1)", "http://user:pw@example.com/", "http://example.com@127.0.0.1/", "http://exa mple.com/", "http://example.com:99999/", "http:///nohost", "http://ex\\ample.com/"]
+    for u in bad {
+        let r = fetchPreview(u, opts)
+        assertMsg(isBadUrl(r), $"{u} -> {errText(r)}")
+    }
+    // a non-default port is refused before DNS, so this needs no network
+    let r = fetchPreview("http://example.com:8080/", opts)
+    assertMsg(isBlocked(r), $"port -> {errText(r)}")
+    let r2 = fetchPreview("https://example.com:22/", opts)
+    assertMsg(isBlocked(r2), $"port -> {errText(r2)}")
+}
+
+// ── Against local servers ──
+
+// A local server answering every connection with `reply(requestText)`.
+fn serve(count: i64, reply: move (string) => string): i64 {
+    let l = TcpListener.bind(0)!
+    let port = l.port() as i64
+    Task.spawn(move(): void => {
+        for _i in 0..count {
+            let Ok(conn) = l.accept() else { return }
+            let req = conn.recvOnce()
+            let _ = conn.send(reply(req))
+        }
+    })
+    return port
+}
+
+fn localOpts(): PreviewOptions {
+    var o = PreviewOptions.defaults()
+    o.allowLoopback = true
+    o.allowAnyPort = true
+    o.totalMs = 3000
+    o.connectMs = 1000
+    return o
+}
+
+fn html200(body: &string): string {
+    return $"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {body.len}\r\nConnection: close\r\n\r\n{body}"
+}
+
+fn testLocalFetchAndRedirect() {
+    let target = serve(1, (req: string): string => {
+        let ua = if req.contains("User-Agent: test-agent/1") { "ua-ok" } else { "ua-missing" }
+        return html200($"<title>{ua}</title><meta property=og:image content=/img.png>")
+    })
+    let hop = serve(1, (req: string): string => $"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target}/final\r\nContent-Length: 0\r\n\r\n")
+    var o = localOpts()
+    o.userAgent = "test-agent/1"
+    let p = fetchPreview($"http://127.0.0.1:{hop}/start", o)!
+    assertStrEqual(s(p.title), "ua-ok")
+    // relative URLs resolve against the final URL, not the one asked for
+    assertStrEqual(p.url, $"http://127.0.0.1:{target}/final")
+    assertStrEqual(s(p.image), $"http://127.0.0.1:{target}/img.png")
+}
+
+fn testRedirectToPrivateIsBlocked() {
+    // loopback is allowed for the test server itself, never the ranges behind it
+    let targets = ["http://169.254.169.254/latest/meta-data/iam/", "http://10.0.0.1/", "http://192.168.1.1/admin", "http://[::1]/", "http://[::ffff:169.254.169.254]/"]
+    for t in targets {
+        let loc = t.clone()
+        let port = serve(1, move(req: string): string => $"HTTP/1.1 301 Moved\r\nLocation: {loc}\r\nContent-Length: 0\r\n\r\n")
+        let r = fetchPreview($"http://127.0.0.1:{port}/", localOpts())
+        assertMsg(isBlocked(r), $"redirect to {t} -> {errText(r)}")
+    }
+    let port = serve(1, (req: string): string => "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\n\r\n")
+    let r = fetchPreview($"http://127.0.0.1:{port}/", localOpts())
+    assertMsg(isBadUrl(r), $"redirect to file: -> {errText(r)}")
+}
+
+fn testRedirectLoopStops() {
+    // the first request and five redirects; a sixth is never sent. The server must
+    // not wait for more connections than arrive, or the test never exits.
+    let port = serve(6, (req: string): string => "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n")
+    let r = fetchPreview($"http://127.0.0.1:{port}/", localOpts())
+    assertStrEqual(errText(r), "too many redirects")
+}
+
+fn testMaxBytes() {
+    // a page that never ends: the head is read, the rest is never buffered
+    let l = TcpListener.bind(0)!
+    let port = l.port()
+    Task.spawn(move(): void => {
+        let Ok(conn) = l.accept() else { return }
+        let _ = conn.recvOnce()
+        let _ = conn.send("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<head><meta property=og:title content=\"big page\"></head><body>")
+        var chunk = ""
+        for _i in 0..4096 {
+            chunk.push('x')
+        }
+        for _i in 0..100000 {
+            if let Err(_) = conn.send(chunk) {
+                break
+            }
+        }
+    })
+    var o = localOpts()
+    o.maxBytes = 65536
+    let t0 = epochMillis()
+    let p = fetchPreview($"http://127.0.0.1:{port}/", o)!
+    assertStrEqual(s(p.title), "big page")
+    assertMsg(epochMillis() - t0 < 3000, "stopped reading at the cap")
+}
+
+fn testTimeout() {
+    // accepts (from its backlog) and never answers
+    let silent = TcpListener.bind(0)!
+    let port = silent.port()
+    var o = localOpts()
+    o.totalMs = 400
+    let t0 = epochMillis()
+    let r = fetchPreview($"http://127.0.0.1:{port}/", o)
+    let took = epochMillis() - t0
+    assertMsg(errText(r).startsWith("timeout"), errText(r))
+    assertMsg(took >= 350 && took < 3000, $"took {took} ms")
+}
+
+fn testNotHtmlAndStatus() {
+    let json = serve(1, (req: string): string => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+    assertStrEqual(errText(fetchPreview($"http://127.0.0.1:{json}/", localOpts())), "not html: application/json")
+    let missing = serve(1, (req: string): string => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    assertStrEqual(errText(fetchPreview($"http://127.0.0.1:{missing}/", localOpts())), "http status 404")
+    let img = serve(1, (req: string): string => "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\n\r\nPNG!")
+    let p = fetchPreview($"http://127.0.0.1:{img}/cat.png", localOpts())!
+    assertStrEqual(s(p.kind), "image")
+    assertStrEqual(s(p.image), $"http://127.0.0.1:{img}/cat.png")
+}
+
+fn testLatin1Page() {
+    let port = serve(1, (req: string): string => {
+        let body = "<title>Caf\xe9 \x93quoted\x94</title>"
+        return $"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=windows-1252\r\nContent-Length: {body.len}\r\n\r\n{body}"
+    })
+    let p = fetchPreview($"http://127.0.0.1:{port}/", localOpts())!
+    assertStrEqual(s(p.title), "Café “quoted”")
+}
+
+fn testOembedFetchedThroughSameChecks() {
+    let api = serve(1, (req: string): string => {
+        let body = "{\"title\":\"from oembed\",\"thumbnail_url\":\"http://127.0.0.1/t.jpg\",\"html\":\"<iframe></iframe>\"}"
+        return $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.len}\r\n\r\n{body}"
+    })
+    let pagePort = serve(1, move(req: string): string => html200($"<link rel=alternate type=application/json+oembed href=\"http://127.0.0.1:{api}/oembed\">"))
+    var o = localOpts()
+    o.fetchOembed = true
+    let p = fetchPreview($"http://127.0.0.1:{pagePort}/v", o)!
+    assertStrEqual(s(p.title), "from oembed")
+    assertStrEqual(s(p.oembedHtml), "<iframe></iframe>")
+    // and an endpoint on a private address is never requested
+    let evil = serve(1, (req: string): string => html200("<title>t</title><link rel=alternate type=application/json+oembed href=\"http://169.254.169.254/oembed\">"))
+    let q = fetchPreview($"http://127.0.0.1:{evil}/v", o)!
+    assertStrEqual(s(q.title), "t")
+    assertStrEqual(s(q.oembedHtml), "<none>")
+}
+
+fn testMaxBytesCutsInsideACharacter() {
+    // an odd cap lands inside a two-byte character; the cut must not trap
+    let port = serve(1, (req: string): string => {
+        var body = "<title>"
+        for _i in 0..5000 {
+            body.pushStr("é")
+        }
+        return html200(body)
+    })
+    var o = localOpts()
+    o.maxBytes = 4002
+    let p = fetchPreview($"http://127.0.0.1:{port}/", o)!
+    assertTrue(s(p.title).startsWith("éé"))
+}
